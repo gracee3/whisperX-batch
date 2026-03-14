@@ -1,6 +1,6 @@
-# whisperx-batch
+# whisperX-batch
 
-whisperx-batch is a Docker-first batch ASR stack for local environments.
+whisperX-batch is a Docker-first batch ASR stack for local environments.
 It runs WhisperX transcription with optional diarization over directories of files, supports reproducible benchmark sweeps, and is tuned for deterministic local/offline execution.
 
 ## Stack
@@ -280,4 +280,4 @@ Tested on: NVIDIA GeForce RTX 3090 (24 GB VRAM), using GPU1 for all reported swe
 
 ## License
 
-MIT.
+MIT
