@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""
+Run transcribe sweeps on a dataset and score outputs by WER.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import itertools
+import json
+import re
+import subprocess
+import sys
+import time
+import threading
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import shutil
+from config_utils import load_toml_config
+from script_defaults import resolve_benchmark_defaults
+from benchmark_utils import parse_kv_items, whisper_arg_for_sweep
+
+
+DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "config.toml")
+
+
+def parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+    "-c",
+    "--config",
+    default=DEFAULT_CONFIG_PATH,
+    help="Load benchmark defaults from TOML config file.",
+  )
+  parser.add_argument("--dataset", default=None, help="Dataset root directory.")
+  parser.add_argument(
+    "--ext",
+    default=None,
+    choices=["wav"],
+    help="Audio extension to process (without dot). Must be wav for LibriSpeech-style harness workflow.",
+  )
+  parser.add_argument("--transcribe", default=None, help="transcribe executable.")
+  parser.add_argument("--output-root", default=None, help="Benchmark output root.")
+  parser.add_argument(
+    "--output-format",
+    default=None,
+    choices=["all", "txt", "json", "srt", "vtt", "tsv", "aud"],
+    help="Output format passed to transcribe.",
+  )
+  parser.add_argument(
+    "--score-format",
+    default=None,
+    choices=["txt", "json", "srt", "vtt", "tsv", "aud"],
+    help="Reference file extension used when scoring.",
+  )
+  parser.add_argument(
+    "--max-files",
+    type=int,
+    default=None,
+    help="Optional cap on files per run (0 = no cap).",
+  )
+  parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=None,
+    help="batch-size passed to transcribe.",
+  )
+  parser.add_argument(
+    "--transcribe-config",
+    default=None,
+    help="Optional transcribe config.toml to reuse for every run.",
+  )
+  parser.add_argument(
+    "--set",
+    action="append",
+    default=[],
+    metavar="key=val",
+    help="Fixed whisper option for every run. Repeat for multiple keys.",
+  )
+  parser.add_argument(
+    "--sweep",
+    action="append",
+    default=[],
+    metavar="key=val1,val2",
+    help="Tune candidates. Uses cartesian product across all sweep entries.",
+  )
+  parser.add_argument(
+    "--whisper-arg",
+    action="append",
+    default=[],
+    metavar="ARG",
+    help="Extra transcribe --whisper-arg token (repeatable).",
+  )
+  parser.add_argument(
+    "--skip-transcribe-existing",
+    action="store_true",
+    help="Pass transcribe --skip-transcribe-existing.",
+  )
+  parser.set_defaults(skip_transcribe_existing=None)
+  parser.add_argument(
+    "--results-csv",
+    default=None,
+    help="Optional CSV destination.",
+  )
+  parser.add_argument("--limit", type=int, default=None, help="Limit number of runs evaluated (debug).")
+  parser.set_defaults(no_diarize=None)
+  parser.add_argument(
+    "--diarize",
+    action="store_false",
+    dest="no_diarize",
+    help="Enable diarization (overrides benchmark default).",
+  )
+  parser.add_argument("--no-diarize", action="store_true", help="Pass --no-diarize to transcribe. [default]")
+  parser.add_argument(
+    "--trace",
+    action="store_true",
+    help="Collect GPU resource traces for each run and emit trace.json per run.",
+  )
+  parser.add_argument(
+    "--trace-interval",
+    type=float,
+    default=2.0,
+    help="Interval (seconds) between trace samples.",
+  )
+  return parser.parse_args()
+
+
+def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
+  return resolve_benchmark_defaults(args)
+
+
+def iter_datasets(dataset: Path, ext: str) -> Iterable[Path]:
+  return sorted((p for p in dataset.rglob(f"*.{ext}")))
+
+
+def load_references(dataset: Path) -> Dict[str, str]:
+  refs: Dict[str, str] = {}
+  for t in dataset.rglob("*.trans.txt"):
+    try:
+      lines = t.read_text(encoding="utf-8").splitlines()
+    except OSError:
+      continue
+    for line in lines:
+      line = line.strip()
+      if not line:
+        continue
+      stem, txt = line.split(maxsplit=1) if " " in line else (line, "")
+      refs.setdefault(stem, txt.strip())
+  return refs
+
+
+def build_manifest(dataset: Path, ext: str, refs: Dict[str, str], max_files: int) -> List[Tuple[Path, str]]:
+  manifest: List[Tuple[Path, str]] = []
+
+  for audio in iter_datasets(dataset, ext):
+    ref = refs.get(audio.stem)
+    if not ref:
+      continue
+    manifest.append((audio, ref))
+    if max_files and len(manifest) >= max_files:
+      break
+
+  return manifest
+
+
+def normalize(text: str) -> List[str]:
+  text = text.lower()
+  text = re.sub(r"[^\w\s']", " ", text)
+  text = re.sub(r"\s+", " ", text).strip()
+  return text.split() if text else []
+
+
+def wer(reference: str, hypothesis: str) -> float:
+  ref = normalize(reference)
+  hyp = normalize(hypothesis)
+  if not ref:
+    return 0.0 if not hyp else 1.0
+
+  rows = len(ref) + 1
+  cols = len(hyp) + 1
+  dp = [[0] * cols for _ in range(rows)]
+  for i in range(rows):
+    dp[i][0] = i
+  for j in range(cols):
+    dp[0][j] = j
+
+  for i in range(1, rows):
+    for j in range(1, cols):
+      cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+      dp[i][j] = min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost,
+      )
+  return dp[-1][-1] / float(len(ref))
+
+
+def parse_txt_prediction(path: Path) -> str:
+  try:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+  except OSError:
+    return ""
+
+  # When --diarize is enabled, WhisperX TXT output may contain speaker prefixes like:
+  # [SPEAKER_00]: tokenized phrase text.
+  # These labels are not present in LibriSpeech references, so strip them before WER.
+  return re.sub(r"(?m)^\[SPEAKER_[^\]]+\]:\s*", "", raw).strip()
+
+
+def to_float(value: object, default: float = 0.0) -> float:
+  try:
+    return float(value)
+  except (TypeError, ValueError):
+    return default
+
+
+def parse_json_prediction(path: Path) -> str:
+  return parse_json_prediction_with_metrics(path)[0]
+
+
+def parse_json_prediction_with_metrics(path: Path) -> Tuple[str, int, float]:
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+  except (OSError, json.JSONDecodeError):
+    return "", 0, 0.0
+
+  segments = payload.get("segments") if isinstance(payload, dict) else None
+  if not isinstance(segments, list):
+    top_level = str(payload.get("text", "")).strip() if isinstance(payload, dict) else ""
+    duration = to_float(payload.get("duration", 0.0)) if isinstance(payload, dict) else 0.0
+    if isinstance(duration, (int, float)) and duration < 0:
+      duration = 0.0
+    return top_level, len(normalize(top_level)), max(duration, 0.0)
+
+  out_parts: List[str] = []
+  token_count = 0
+  duration = 0.0
+
+  for segment in segments:
+    text = ""
+    if isinstance(segment, dict):
+      text = str(segment.get("text", "")).strip()
+      end = to_float(segment.get("end", 0.0))
+      if end > duration:
+        duration = end
+
+      words = segment.get("words")
+      if isinstance(words, list) and words:
+        word_tokens = 0
+        for word in words:
+          if not isinstance(word, dict):
+            continue
+          if isinstance(word.get("word"), str):
+            word_tokens += 1
+          word_end = to_float(word.get("end", 0.0))
+          if word_end > duration:
+            duration = word_end
+        if word_tokens > 0:
+          token_count += word_tokens
+          if text:
+            out_parts.append(text)
+          continue
+    if text:
+      out_parts.append(text)
+      token_count += len(normalize(text))
+
+  if not out_parts:
+    top_level = str(payload.get("text", "")).strip() if isinstance(payload, dict) else ""
+    if top_level:
+      return top_level, len(normalize(top_level)), max(duration, 0.0)
+
+  return " ".join(out_parts), token_count, max(duration, 0.0)
+
+
+def load_prediction_text(path: Path, fmt: str) -> str:
+  if fmt == "txt":
+    return parse_txt_prediction(path)
+  if fmt == "json":
+    return parse_json_prediction(path)
+  return path.read_text(encoding="utf-8", errors="ignore").strip()
+
+
+def build_score_path(output_dir: Path, stem: str, score_format: str) -> Path:
+  return output_dir / f"{stem}.{score_format}"
+
+
+def build_run_command(
+  args: argparse.Namespace,
+  input_dir: Path,
+  run_root: Path,
+  combo: Dict[str, str],
+) -> List[str]:
+  output_dir = run_root / "output"
+  output_dir.mkdir(parents=True, exist_ok=True)
+
+  cmd = [
+    args.transcribe,
+    "--batch-size",
+    str(args.batch_size),
+    "--input-dir",
+    str(input_dir),
+    "--output-dir",
+    str(output_dir),
+    "--output-format",
+    args.output_format,
+    "--recursive",
+  ]
+  if args.skip_transcribe_existing:
+    cmd.append("--skip-transcribe-existing")
+  if not args.no_diarize:
+    cmd.append("--diarize")
+  if args.transcribe_config:
+    cmd.extend(["--config", args.transcribe_config])
+
+  for key, value in sorted(combo.items()):
+    for arg in whisper_arg_for_sweep(key, value):
+      cmd.append(arg)
+
+  for extra in args.whisper_arg:
+    cmd.extend(["--whisper-arg", extra])
+
+  return cmd
+
+
+def parse_cuda_devices(raw: object) -> List[str]:
+  if raw is None:
+    return []
+  if isinstance(raw, str):
+    value = raw
+  else:
+    value = str(raw)
+  return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+
+
+def extract_cuda_devices_from_cmd(cmd: Sequence[str]) -> List[str]:
+  for idx, token in enumerate(cmd):
+    if token != "--cuda-devices":
+      continue
+    if idx + 1 >= len(cmd):
+      return []
+    return parse_cuda_devices(cmd[idx + 1])
+  return []
+
+
+def read_transcribe_cuda_devices(config_path: str) -> List[str]:
+  try:
+    cfg = load_toml_config(config_path)
+  except (OSError, TypeError, ValueError):
+    return []
+  if not isinstance(cfg, dict):
+    return []
+  trans_cfg = cfg.get("transcribe", {})
+  if not isinstance(trans_cfg, dict):
+    return []
+  return parse_cuda_devices(trans_cfg.get("cuda_devices"))
+
+
+def resolve_trace_device_filter(cmd: Sequence[str], transcribe_config: str, combo: Dict[str, str]) -> str:
+  combo_devices = parse_cuda_devices(combo.get("cuda-devices", ""))
+  if combo_devices:
+    return ",".join(combo_devices)
+  cmd_devices = extract_cuda_devices_from_cmd(cmd)
+  if cmd_devices:
+    return ",".join(cmd_devices)
+  cfg_devices = read_transcribe_cuda_devices(transcribe_config)
+  return ",".join(cfg_devices)
+
+
+def query_gpu_samples(gpu_filter: str) -> List[Dict[str, object]]:
+  smi = shutil.which("nvidia-smi")
+  if not smi:
+    return []
+  cmd = [
+    smi,
+    "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+    "--format=csv,noheader,nounits",
+  ]
+  if gpu_filter:
+    cmd.extend(["-i", gpu_filter])
+  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  if proc.returncode != 0:
+    return []
+
+  samples: List[Dict[str, object]] = []
+  for raw in proc.stdout.splitlines():
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) < 4:
+      continue
+    idx, mem_used, mem_total, util = parts[:4]
+    try:
+      mem_used_i = int(float(mem_used))
+      mem_total_i = int(float(mem_total))
+      util_f = float(util)
+    except ValueError:
+      continue
+    samples.append(
+      {
+        "index": idx,
+        "mem_used_mib": mem_used_i,
+        "mem_total_mib": mem_total_i,
+        "utilization_pct": util_f,
+      },
+    )
+  return samples
+
+
+def collect_gpu_samples(
+  stop_event: threading.Event,
+  interval: float,
+  gpu_filter: str,
+  samples: List[Dict[str, object]],
+) -> None:
+  while not stop_event.is_set():
+    sample = query_gpu_samples(gpu_filter)
+    if sample:
+      samples.append({"ts": time.time(), "gpus": sample})
+    stop_event.wait(interval)
+
+
+def summarize_gpu_samples(samples: List[Dict[str, object]], interval: float) -> Dict[str, str]:
+  if not samples:
+    return {
+      "trace_sample_count": "0",
+      "trace_sample_interval_s": f"{interval}",
+      "trace_devices": "",
+      "trace_gpu_peak_mem_mib": "",
+      "trace_gpu_peak_mem_pct": "",
+      "trace_gpu_avg_util_pct": "",
+      "trace_gpu_peak_util_pct": "",
+    }
+
+  device_util: Dict[str, List[float]] = {}
+  device_mem_used: Dict[str, List[float]] = {}
+  device_mem_total: Dict[str, List[float]] = {}
+  for sample in samples:
+    for gpu in sample.get("gpus", []):
+      if not isinstance(gpu, dict):
+        continue
+      idx = str(gpu.get("index", "")).strip()
+      if not idx:
+        continue
+      try:
+        util = float(gpu.get("utilization_pct", 0.0))
+        mem_used = float(gpu.get("mem_used_mib", 0.0))
+        mem_total = float(gpu.get("mem_total_mib", 0.0))
+      except (TypeError, ValueError):
+        continue
+      device_util.setdefault(idx, []).append(util)
+      device_mem_used.setdefault(idx, []).append(mem_used)
+      device_mem_total.setdefault(idx, []).append(mem_total)
+
+  if not device_util:
+    return {
+      "trace_sample_count": str(len(samples)),
+      "trace_sample_interval_s": f"{interval}",
+      "trace_devices": "",
+      "trace_gpu_peak_mem_mib": "",
+      "trace_gpu_peak_mem_pct": "",
+      "trace_gpu_avg_util_pct": "",
+      "trace_gpu_peak_util_pct": "",
+    }
+
+  def pick_peak(mapping: Dict[str, List[float]]) -> Dict[str, float]:
+    return {k: max(v) for k, v in mapping.items() if v}
+
+  peak_util = pick_peak(device_util)
+  avg_util = {k: sum(v) / len(v) for k, v in device_util.items() if v}
+  peak_mem_used = pick_peak(device_mem_used)
+  peak_mem_total: Dict[str, float] = {k: max(v) if v else 0 for k, v in device_mem_total.items()}
+
+  def join_int(mapping: Dict[str, float]) -> str:
+    return ";".join(f"{k}:{mapping[k]:.0f}" for k in sorted(mapping))
+
+  def join_one(mapping: Dict[str, float]) -> str:
+    return ";".join(f"{k}:{mapping[k]:.1f}" for k in sorted(mapping))
+
+  mem_pct = {}
+  for key, peak_mem in peak_mem_used.items():
+    total = peak_mem_total.get(key) or 0.0
+    mem_pct[key] = (peak_mem / total * 100.0) if total > 0 else 0.0
+
+  return {
+    "trace_sample_count": str(len(samples)),
+    "trace_sample_interval_s": f"{interval}",
+    "trace_devices": ";".join(sorted(peak_mem_used)),
+    "trace_gpu_peak_mem_mib": join_int(peak_mem_used),
+    "trace_gpu_peak_mem_pct": join_one(mem_pct),
+    "trace_gpu_avg_util_pct": join_one(avg_util),
+    "trace_gpu_peak_util_pct": join_one(peak_util),
+  }
+
+
+def write_trace_json(
+  args: argparse.Namespace,
+  run_root: Path,
+  cmd: List[str],
+  runtime_s: float,
+  returncode: int,
+  samples: List[Dict[str, object]],
+  summary: Dict[str, str],
+) -> Dict[str, object]:
+  path = run_root / "trace.json"
+  payload = {
+    "run_root": str(run_root),
+    "returncode": returncode,
+    "trace_interval_s": args.trace_interval,
+    "runtime_s": runtime_s,
+    "command": cmd,
+    "sample_count": len(samples),
+    "samples": samples,
+    "summary": summary,
+  }
+  try:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+  except OSError:
+    pass
+  return {
+    "trace_file": str(path),
+    "trace_sample_count": str(summary.get("trace_sample_count", "0")),
+    "trace_sample_interval_s": str(summary.get("trace_sample_interval_s", "0")),
+    "trace_devices": summary.get("trace_devices", ""),
+    "trace_gpu_peak_mem_mib": summary.get("trace_gpu_peak_mem_mib", ""),
+    "trace_gpu_peak_mem_pct": summary.get("trace_gpu_peak_mem_pct", ""),
+    "trace_gpu_avg_util_pct": summary.get("trace_gpu_avg_util_pct", ""),
+    "trace_gpu_peak_util_pct": summary.get("trace_gpu_peak_util_pct", ""),
+  }
+
+
+def compute_token_rate_stats(
+  counts: List[Tuple[int, float]],
+  runtime_s: float,
+) -> Tuple[float, float]:
+  if not counts or runtime_s <= 0:
+    return 0.0, 0.0
+
+  total_tokens = sum(c for c, _ in counts)
+  avg = total_tokens / runtime_s
+
+  total_duration = sum(d for _, d in counts if d > 0)
+  if total_duration <= 0:
+    file_rate = runtime_s / len(counts)
+    if file_rate <= 0:
+      return avg, 0.0
+    rates = [c / file_rate for c, _ in counts]
+    return avg, max(rates)
+
+  rates = []
+  for tokens, dur in counts:
+    if dur <= 0:
+      rates.append(0.0)
+      continue
+    rates.append(tokens / (runtime_s * (dur / total_duration)))
+  return avg, (max(rates) if rates else 0.0)
+
+
+def run_combo(
+  args: argparse.Namespace,
+  dataset: Path,
+  manifest: List[Tuple[Path, str]],
+  combo_idx: int,
+  combo: Dict[str, str],
+) -> Dict[str, object]:
+  run_root = Path(args.output_root) / f"run_{combo_idx:03d}"
+  output_root = run_root / "output"
+  run_input = run_root / "input"
+  run_input.mkdir(parents=True, exist_ok=True)
+
+  for audio, _ in manifest:
+    link_name = run_input / audio.relative_to(dataset)
+    link_name.parent.mkdir(parents=True, exist_ok=True)
+    if link_name.exists() or link_name.is_symlink():
+      link_name.unlink()
+    shutil.copy2(audio, link_name)
+
+  cmd = build_run_command(args, run_input, run_root, combo)
+  gpu_filter = resolve_trace_device_filter(cmd, str(args.transcribe_config), combo)
+  trace_samples: List[Dict[str, object]] = []
+  trace_thread: threading.Thread | None = None
+  trace_stop: threading.Event | None = None
+
+  if args.trace and args.trace_interval > 0:
+    trace_stop = threading.Event()
+    trace_thread = threading.Thread(
+      target=collect_gpu_samples,
+      args=(trace_stop, args.trace_interval, gpu_filter, trace_samples),
+      daemon=True,
+    )
+    trace_thread.start()
+
+  start = time.perf_counter()
+  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  runtime = time.perf_counter() - start
+
+  if trace_thread and trace_stop:
+    trace_stop.set()
+    trace_thread.join(timeout=1.0)
+
+  trace_summary = summarize_gpu_samples(trace_samples, args.trace_interval) if args.trace else {}
+  trace_metadata = write_trace_json(
+    args,
+    run_root,
+    cmd,
+    runtime,
+    proc.returncode,
+    trace_samples,
+    trace_summary if args.trace else {},
+  ) if args.trace else {}
+
+  base_row = {
+    "run_id": run_root.name,
+    "runtime_s": runtime,
+    "num_files": len(manifest),
+    "files_per_second": (len(manifest) / runtime) if runtime > 0 else 0.0,
+    "seconds_per_file": (runtime / len(manifest)) if manifest else 0.0,
+    "input_toks_per_sec_avg": 0.0,
+    "input_toks_per_sec_peak": 0.0,
+    "decode_toks_per_sec_avg": 0.0,
+    "decode_toks_per_sec_peak": 0.0,
+    "encode_toks_per_sec_avg": 0.0,
+    "encode_toks_per_sec_peak": 0.0,
+  }
+
+  if proc.returncode != 0:
+    if proc.stdout:
+      print(proc.stdout)
+    base_row.update(
+      {
+        "status": "failed",
+        "missing": len(manifest),
+        "avg_wer": 1.0,
+      },
+    )
+    base_row.update(trace_metadata)
+    return base_row
+
+  wer_scores: List[float] = []
+  input_token_pairs: List[Tuple[int, float]] = []
+  decode_token_pairs: List[Tuple[int, float]] = []
+  encode_token_pairs: List[Tuple[int, float]] = []
+  missing = 0
+
+  score_format = args.score_format
+  if args.output_format == "all" and score_format not in {"txt", "json"}:
+    # json and txt are the only practical formats for WER-based scoring.
+    base_row.update(
+      {
+        "status": "partial",
+        "missing": len(manifest),
+        "avg_wer": 1.0,
+      },
+    )
+    base_row.update(trace_metadata)
+    return base_row
+  if args.output_format != "all":
+    score_format = args.output_format
+
+  for audio, ref in manifest:
+    pred_txt = build_score_path(output_root, audio.stem, score_format)
+    if not pred_txt.exists():
+      missing += 1
+      continue
+    pred = ""
+    pred_tokens = 0
+    pred_audio_s = 0.0
+    if score_format == "json":
+      pred, pred_tokens, pred_audio_s = parse_json_prediction_with_metrics(pred_txt)
+    else:
+      pred = load_prediction_text(pred_txt, score_format)
+      pred_tokens = len(normalize(pred))
+    if not pred.strip():
+      missing += 1
+      continue
+
+    ref_tokens = len(normalize(ref))
+    if ref_tokens > 0:
+      input_token_pairs.append((ref_tokens, pred_audio_s))
+    if pred_tokens > 0:
+      decode_token_pairs.append((pred_tokens, pred_audio_s))
+    if pred_tokens > 0:
+      encode_token_pairs.append((pred_tokens, pred_audio_s))
+
+    wer_scores.append(wer(ref, pred))
+
+  if not wer_scores:
+    avg = 1.0
+  else:
+    avg = sum(wer_scores) / len(wer_scores)
+
+  input_rate_avg, input_rate_peak = compute_token_rate_stats(input_token_pairs, runtime)
+  decode_rate_avg, decode_rate_peak = compute_token_rate_stats(decode_token_pairs, runtime)
+  encode_rate_avg, encode_rate_peak = compute_token_rate_stats(encode_token_pairs, runtime)
+  base_row.update(
+    {
+      "status": "ok" if missing == 0 else "partial",
+      "missing": missing,
+      "avg_wer": avg,
+      "input_toks_per_sec_avg": input_rate_avg,
+      "input_toks_per_sec_peak": input_rate_peak,
+      "decode_toks_per_sec_avg": decode_rate_avg,
+      "decode_toks_per_sec_peak": decode_rate_peak,
+      "encode_toks_per_sec_avg": encode_rate_avg,
+      "encode_toks_per_sec_peak": encode_rate_peak,
+    },
+  )
+  base_row.update(trace_metadata)
+  return base_row
+
+
+def run() -> int:
+  args = apply_defaults(parse_args())
+  dataset = Path(args.dataset).resolve()
+  output_root = Path(args.output_root).resolve()
+  output_root.mkdir(parents=True, exist_ok=True)
+
+  if not dataset.is_dir():
+    print(f"ERROR: dataset directory not found: {dataset}", file=sys.stderr)
+    return 2
+
+  if args.batch_size <= 0:
+    print("--batch-size must be >= 1", file=sys.stderr)
+    return 2
+
+  references = load_references(dataset)
+  if not references:
+    print(
+      f"ERROR: no LibriSpeech references found in {dataset}. "
+      "Expected structure like <speaker>/<chapter>/*.trans.txt and matching audio files.",
+      file=sys.stderr,
+    )
+    return 2
+
+  if args.ext != "wav":
+    print("ERROR: this harness currently supports only wav input.", file=sys.stderr)
+    return 2
+
+  manifest = build_manifest(dataset, args.ext, references, args.max_files)
+  if not manifest:
+    wav_count = len(list(dataset.rglob("*.wav")))
+    if wav_count == 0:
+      print(
+        "ERROR: no WAV files found. Run dataset conversion first (for example: "
+        "python scripts/convert_flac_to_wav.py --root <dataset>), then re-run benchmark.",
+        file=sys.stderr,
+      )
+      return 2
+
+  if not manifest:
+    print(f"ERROR: no files with references found in {dataset}", file=sys.stderr)
+    return 2
+
+  fixed = parse_kv_items(args.set, allow_multiple=False)
+  sweep = parse_kv_items(args.sweep, allow_multiple=True)
+
+  combos: List[Dict[str, str]] = []
+  if sweep:
+    keys = list(sweep.keys())
+    for values in itertools.product(*[sweep[k] for k in keys]):
+      combo = {k: values[idx] for idx, k in enumerate(keys)}
+      combo.update({k: v[0] for k, v in fixed.items()})
+      combos.append(combo)
+  else:
+    combos = [{k: v[0] for k, v in fixed.items()}]
+
+  if args.limit > 0:
+    combos = combos[: args.limit]
+
+  if not combos:
+    print("ERROR: no parameter combos produced", file=sys.stderr)
+    return 2
+
+  param_names = list(dict.fromkeys((*fixed.keys(), *sweep.keys())))
+  trace_fields = [
+    "trace_file",
+    "trace_sample_count",
+    "trace_sample_interval_s",
+    "trace_devices",
+    "trace_gpu_peak_mem_mib",
+    "trace_gpu_peak_mem_pct",
+    "trace_gpu_avg_util_pct",
+    "trace_gpu_peak_util_pct",
+  ]
+  results: List[Dict[str, object]] = []
+  for idx, combo in enumerate(combos, start=1):
+    combo_id = "_".join(f"{k}={v}" for k, v in sorted(combo.items()) if v)
+    print(f"Running [{idx}/{len(combos)}]: {combo_id or '[default]'}")
+    row = run_combo(args, dataset, manifest, idx, combo)
+    row.update(combo)
+    results.append(row)
+
+  results_csv = args.results_csv or str(output_root / "results.csv")
+  field_names = [
+    "run_id",
+    "status",
+    "runtime_s",
+    "input_toks_per_sec_avg",
+    "input_toks_per_sec_peak",
+    "decode_toks_per_sec_avg",
+    "decode_toks_per_sec_peak",
+    "encode_toks_per_sec_avg",
+    "encode_toks_per_sec_peak",
+    "files_per_second",
+    "seconds_per_file",
+    "num_files",
+    "missing",
+    "avg_wer",
+  ] + param_names
+  if args.trace:
+    field_names += trace_fields
+
+  with open(results_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=field_names)
+    writer.writeheader()
+    for row in results:
+      out = {k: row.get(k, "") for k in field_names}
+      out["avg_wer"] = f"{float(out['avg_wer']):.6f}"
+      out["runtime_s"] = f"{float(out['runtime_s']):.3f}"
+      out["input_toks_per_sec_avg"] = f"{float(out['input_toks_per_sec_avg']):.3f}"
+      out["input_toks_per_sec_peak"] = f"{float(out['input_toks_per_sec_peak']):.3f}"
+      out["decode_toks_per_sec_avg"] = f"{float(out['decode_toks_per_sec_avg']):.3f}"
+      out["decode_toks_per_sec_peak"] = f"{float(out['decode_toks_per_sec_peak']):.3f}"
+      out["encode_toks_per_sec_avg"] = f"{float(out['encode_toks_per_sec_avg']):.3f}"
+      out["encode_toks_per_sec_peak"] = f"{float(out['encode_toks_per_sec_peak']):.3f}"
+      out["files_per_second"] = f"{float(out['files_per_second']):.3f}"
+      out["seconds_per_file"] = f"{float(out['seconds_per_file']):.3f}"
+      writer.writerow(out)
+
+  best = sorted(
+    [r for r in results if r["status"] in ("ok", "partial")],
+    key=lambda r: (r["avg_wer"], r["missing"], r["runtime_s"]),
+  )
+  if best:
+    best_entry = best[0]
+  else:
+    best_entry = results[0]
+  print(f"Results written to: {results_csv}")
+  print(
+    "Best run: "
+    f"{best_entry['run_id']} avg_wer={best_entry['avg_wer']:.6f} missing={best_entry['missing']} status={best_entry['status']}"
+  )
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(run())

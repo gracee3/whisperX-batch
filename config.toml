@@ -1,0 +1,95 @@
+# WhisperX defaults for transcribe and benchmark.
+
+[transcribe]
+input_dir = "."
+output_dir = "~/transcribe"
+cuda_devices = "0"
+model = "/data/models/Systran/faster-whisper-large-v3"
+task = "transcribe"
+language = "en"
+output_format = "all"
+device = "cuda"
+compute_type = "float16"
+batch_size = 16
+max_speakers = ""
+skip_transcribe_existing = false
+diarize = true
+docker_image = "whisperx:torch280-cu128"
+docker_pull_policy = "missing"
+docker_cache = "/data/models/.hf-cache"
+recursive = false
+
+[librispeech]
+root = "/home/emmy/Downloads/LibriSpeech"
+subset = "dev-clean"
+url = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
+archive = "dev-clean.tar.gz"
+convert_to_wav = true
+convert_num_proc = 8
+ffmpeg_threads = 0
+keep_archive = true
+convert_if_missing_only = false
+
+[benchmark]
+dataset = "/home/emmy/Downloads/LibriSpeech/dev-clean"
+transcribe = "transcribe"
+ext = "wav"
+output_root = "~/transcribe/temp/whisperx-benchmark"
+# Locked quality-focused benchmark defaults (GPU1, 200-file dev-clean sweep, 2026-03-14):
+# batch_size=16, beam_size=1, best_of=1, temperature=0.0, suppress_numerals=false, no_diarize=true.
+output_format = "json"
+score_format = "json"
+max_files = 0
+batch_size = 16
+skip_transcribe_existing = false
+no_diarize = true
+transcribe_config = "config.toml"
+results_csv = ""
+limit = 0
+
+# Alternate preset example for quick switch:
+# [librispeech]
+# root = "/home/emmy/Downloads/LibriSpeech"
+# subset = "test-clean"
+# url = "https://www.openslr.org/resources/12/test-clean.tar.gz"
+# archive = "test-clean.tar.gz"
+# convert_to_wav = true
+# convert_num_proc = 8
+# ffmpeg_threads = 0
+# keep_archive = true
+# convert_if_missing_only = false
+
+[whisper]
+align_model = "WAV2VEC2_ASR_BASE_960H"
+interpolate_method = "nearest"
+no_align = false
+return_char_alignments = false
+vad_method = ""
+vad_onset = ""
+vad_offset = ""
+chunk_size = ""
+min_speakers = ""
+diarize_model = "/data/models/pyannote/speaker-diarization-community-1"
+speaker_embeddings = false
+temperature = 0
+# Locked quality defaults from benchmark finding on this stack:
+# beam_size=1 and best_of=1 gave best WER with equal or better runtime in GPU1 200-file tuning.
+best_of = 1
+beam_size = 1
+patience = 1.0
+length_penalty = 1.0
+suppress_tokens = "-1"
+suppress_numerals = false
+initial_prompt = ""
+condition_on_previous_text = true
+fp16 = true
+temperature_increment_on_fallback = 0.2
+compression_ratio_threshold = 2.4
+logprob_threshold = -1.0
+no_speech_threshold = 0.6
+max_line_width = 0
+max_line_count = 0
+highlight_words = false
+segment_resolution = "sentence"
+threads = 0
+print_progress = "false"

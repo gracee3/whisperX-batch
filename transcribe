@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""Batch transcription CLI for this repo (Docker-first execution)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from config_utils import parse_bool
+from script_defaults import resolve_transcribe_defaults
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = str(SCRIPT_DIR / "config.toml")
+DEFAULT_OUTPUT_EXTS = ("json", "srt", "tsv", "vtt", "txt", "aud")
+SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".mp3", ".flac"}
+SUPPORTED_DEVICE_PREFIX = "cuda"
+DEFAULT_MAX_DOCKER_FILES = 256
+
+
+def bool_to_str(value: bool) -> str:
+  return "True" if value else "False"
+
+
+def normalize_cli_value(value: object) -> Optional[str]:
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    return bool_to_str(value)
+  return str(value)
+
+
+def ensure_dir(path: str) -> None:
+  Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def is_positive_int(value: object) -> bool:
+  try:
+    i = int(str(value))
+  except (TypeError, ValueError):
+    return False
+  return i > 0
+
+
+def parse_int(value: object) -> int:
+  return int(str(value))
+
+
+def to_csv_list(value: str) -> List[str]:
+  return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_output_format(raw: str) -> List[str]:
+  if not raw or raw == "all":
+    return list(DEFAULT_OUTPUT_EXTS)
+  return to_csv_list(raw)
+
+
+def parse_cuda_devices(raw: str) -> List[str]:
+  if not raw:
+    return []
+  return to_csv_list(raw)
+
+
+def build_whisper_args(
+  model: str,
+  task: str,
+  language: str,
+  output_format: str,
+  device: str,
+  compute_type: str,
+  batch_size: int,
+  max_speakers: str,
+  align_model: str,
+  interpolate_method: str,
+  no_align: bool,
+  return_char_alignments: bool,
+  vad_method: str,
+  vad_onset: str,
+  vad_offset: str,
+  chunk_size: str,
+  diarize: bool,
+  diarize_model: str,
+  speaker_embeddings: bool,
+  temperature: str,
+  best_of: str,
+  beam_size: str,
+  patience: str,
+  length_penalty: str,
+  suppress_tokens: str,
+  suppress_numerals: bool,
+  initial_prompt: str,
+  condition_on_previous_text: str,
+  fp16: str,
+  temperature_increment_on_fallback: str,
+  compression_ratio_threshold: str,
+  logprob_threshold: str,
+  no_speech_threshold: str,
+  max_line_width: str,
+  max_line_count: str,
+  highlight_words: bool,
+  segment_resolution: str,
+  min_speakers: str,
+  threads: str,
+  print_progress: str,
+  verbose: str,
+  log_level: str,
+  hotwords: str,
+  extra_args: List[str],
+) -> List[str]:
+  args = [
+    "whisperx",
+    "--model",
+    model,
+    "--task",
+    task,
+    "--language",
+    language,
+    "--output_format",
+    output_format,
+    "--device",
+    device,
+    "--compute_type",
+    compute_type,
+    "--batch_size",
+    str(batch_size),
+  ]
+
+  def append_if_present(flag: str, value: object) -> None:
+    normalized = normalize_cli_value(value)
+    if normalized:
+      args.extend((flag, normalized))
+
+  def append_boollike(flag: str, value: object) -> None:
+    parsed = parse_bool(value)
+    if parsed is None:
+      append_if_present(flag, value)
+      return
+    args.extend((flag, bool_to_str(parsed)))
+
+  args.extend(("--align_model", align_model) if align_model else ())
+  append_if_present("--interpolate_method", interpolate_method)
+  if no_align:
+    args.append("--no_align")
+  if return_char_alignments:
+    args.append("--return_char_alignments")
+  append_if_present("--vad_method", vad_method)
+  append_if_present("--vad_onset", vad_onset)
+  append_if_present("--vad_offset", vad_offset)
+  append_if_present("--chunk_size", chunk_size)
+  append_if_present("--max_speakers", max_speakers)
+  append_if_present("--min_speakers", min_speakers)
+  if diarize:
+    if diarize_model:
+      args.extend(["--diarize_model", diarize_model])
+    args.append("--diarize")
+  if speaker_embeddings:
+    args.append("--speaker_embeddings")
+  append_if_present("--temperature", temperature)
+  append_if_present("--best_of", best_of)
+  append_if_present("--beam_size", beam_size)
+  append_if_present("--patience", patience)
+  append_if_present("--length_penalty", length_penalty)
+  append_if_present("--suppress_tokens", suppress_tokens)
+  if suppress_numerals:
+    args.append("--suppress_numerals")
+  append_if_present("--initial_prompt", initial_prompt)
+  append_boollike("--condition_on_previous_text", condition_on_previous_text)
+  append_boollike("--fp16", fp16)
+  append_if_present("--temperature_increment_on_fallback", temperature_increment_on_fallback)
+  append_if_present("--compression_ratio_threshold", compression_ratio_threshold)
+  append_if_present("--logprob_threshold", logprob_threshold)
+  append_if_present("--no_speech_threshold", no_speech_threshold)
+  append_if_present("--max_line_width", max_line_width)
+  append_if_present("--max_line_count", max_line_count)
+  if highlight_words:
+    args.append("--highlight_words")
+  append_if_present("--segment_resolution", segment_resolution)
+  append_if_present("--threads", threads)
+  append_boollike("--print_progress", print_progress)
+  append_if_present("--verbose", verbose)
+  append_if_present("--log-level", log_level)
+  append_if_present("--hotwords", hotwords)
+
+  args.extend(extra_args)
+  return args
+
+
+def build_container_input_names(input_files: Sequence[Path]) -> List[Tuple[Path, str]]:
+  seen: Dict[str, int] = {}
+  out: List[Tuple[Path, str]] = []
+  for audio in input_files:
+    name = audio.name
+    count = seen.get(name, 0)
+    seen[name] = count + 1
+    mapped_name = name if count == 0 else f"{audio.stem}_{count}{audio.suffix}"
+    out.append((audio, mapped_name))
+  return out
+
+
+def output_exists(output_dir: Path, mapped_name: str, exts: Sequence[str]) -> bool:
+  stem = Path(mapped_name).with_suffix("").name
+  for ext in exts:
+    if (output_dir / f"{stem}.{ext}").exists():
+      return True
+  return False
+
+
+def chunk_inputs(
+  items: Sequence[Tuple[Path, str]],
+  chunk_size: int,
+) -> List[Sequence[Tuple[Path, str]]]:
+  if chunk_size <= 0:
+    return [items]
+  return [list(items[i : i + chunk_size]) for i in range(0, len(items), chunk_size)]
+
+
+def mount_cache(cache_dir: str) -> Tuple[str, bool]:
+  cache_path = Path(cache_dir).expanduser()
+  cache_path.mkdir(parents=True, exist_ok=True)
+  scope = cache_path
+  if not os.access(scope, os.W_OK):
+    raise PermissionError(f"cache dir is not writable: {scope}")
+
+  for sub in ("hf", "torch", "xdg", "nltk_data"):
+    (scope / sub).mkdir(parents=True, exist_ok=True)
+  return str(scope), False
+
+
+def check_large_v3_layout(model_path: Path) -> None:
+  if "large-v3" not in model_path.name and "large-v3" not in str(model_path):
+    return
+  if not model_path.is_dir():
+    raise ValueError(f"--model '{model_path}' is not a directory")
+  if not (model_path / "model.bin").exists():
+    raise ValueError(
+      "large-v3 requires CTranslate2 model.bin layout and is not compatible with raw HF checkpoints.",
+    )
+  if not ((model_path / "preprocessor_config.json").exists() or (model_path / "processor_config.json").exists()):
+    raise ValueError(
+      "large-v3 requires preprocessor_config.json or processor_config.json to prevent 80/128-mel mismatch.",
+    )
+
+
+def collect_mount_ro_paths(paths: Sequence[str]) -> List[str]:
+  mounts: Dict[str, None] = {}
+  for raw in paths:
+    if not raw:
+      continue
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+      p = p.resolve()
+    if not p.exists():
+      continue
+    mount_root = p if p.is_dir() else p.parent
+    mounts[str(mount_root)] = None
+  return sorted(mounts.keys())
+
+
+def shell_quote(value: str) -> str:
+  return "'" + value.replace("'", "'\\''") + "'"
+
+
+def build_shell_command(args: Sequence[str]) -> str:
+  return " ".join(shell_quote(arg) for arg in args)
+
+
+def parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+  parser.add_argument(
+    "-c",
+    "--config",
+    default=DEFAULT_CONFIG_PATH,
+    help="Load defaults from TOML config file.",
+  )
+  parser.add_argument("--no-config", action="store_true", help="Ignore config file.")
+  parser.add_argument("--input-dir", help="Input directory containing audio files.")
+  parser.add_argument("--output-dir", help="Output directory for transcript artifacts.")
+  parser.add_argument(
+    "--cuda-devices",
+    help="Comma-separated CUDA device IDs to pass to --gpus (defaults to 0).",
+  )
+  parser.add_argument(
+    "--recursive",
+    dest="recursive",
+    action="store_true",
+    help="Recurse into subdirectories when discovering files.",
+  )
+  parser.add_argument(
+    "--no-recursive",
+    dest="recursive",
+    action="store_false",
+    help="Disable recursion (default).",
+  )
+  parser.set_defaults(recursive=None)
+  parser.add_argument("--model", help="WhisperX model path (required local snapshot).")
+  parser.add_argument("--task", help="WhisperX task.")
+  parser.add_argument("--language", help="WhisperX language.")
+  parser.add_argument("--output-format", help="WhisperX output format.")
+  parser.add_argument("--align-model", help="WhisperX align model/path.")
+  parser.add_argument("--interpolate-method", help="WhisperX interpolation method.")
+  parser.add_argument("--no-align", action="store_true", help="Disable alignment.")
+  parser.set_defaults(no_align=None)
+  parser.add_argument("--return-char-alignments", action="store_true", help="Enable character-level alignments.")
+  parser.set_defaults(return_char_alignments=None)
+  parser.add_argument("--vad-method", help="WhisperX VAD method.")
+  parser.add_argument("--vad-onset", help="WhisperX VAD onset.")
+  parser.add_argument("--vad-offset", help="WhisperX VAD offset.")
+  parser.add_argument("--chunk-size", help="WhisperX chunk size.")
+  parser.add_argument("--device", help="WhisperX --device argument.")
+  parser.add_argument("--compute-type", help="WhisperX --compute_type argument.")
+  parser.add_argument("--batch-size", help="WhisperX --batch_size argument.")
+  parser.add_argument("--max-speakers", help="WhisperX --max_speakers.")
+  parser.add_argument("--min-speakers", help="WhisperX --min_speakers.")
+  parser.add_argument("--diarize-model", help="WhisperX diarize model path.")
+  parser.add_argument("--speaker-embeddings", action="store_true", help="Enable speaker embeddings.")
+  parser.set_defaults(speaker_embeddings=None)
+  parser.add_argument("--temperature", help="WhisperX --temperature.")
+  parser.add_argument("--best-of", help="WhisperX --best_of.")
+  parser.add_argument("--beam-size", help="WhisperX --beam_size.")
+  parser.add_argument("--patience", help="WhisperX --patience.")
+  parser.add_argument("--length-penalty", help="WhisperX --length_penalty.")
+  parser.add_argument("--suppress-tokens", help="WhisperX --suppress_tokens.")
+  parser.add_argument("--suppress-numerals", action="store_true", help="Enable suppress_numerals.")
+  parser.set_defaults(suppress_numerals=None)
+  parser.add_argument("--initial-prompt", help="WhisperX --initial_prompt.")
+  parser.add_argument("--condition-on-previous-text", help="WhisperX --condition_on_previous_text.")
+  parser.add_argument("--fp16", help="WhisperX --fp16.")
+  parser.add_argument(
+    "--temperature-increment-on-fallback",
+    help="WhisperX --temperature_increment_on_fallback.",
+  )
+  parser.add_argument("--compression-ratio-threshold", help="WhisperX --compression_ratio_threshold.")
+  parser.add_argument("--logprob-threshold", help="WhisperX --logprob_threshold.")
+  parser.add_argument("--no-speech-threshold", help="WhisperX --no_speech_threshold.")
+  parser.add_argument("--max-line-width", help="WhisperX --max_line_width.")
+  parser.add_argument("--max-line-count", help="WhisperX --max_line_count.")
+  parser.add_argument("--highlight-words", action="store_true", help="Enable highlight_words output.")
+  parser.set_defaults(highlight_words=None)
+  parser.add_argument("--segment-resolution", help="WhisperX --segment_resolution.")
+  parser.add_argument("--threads", help="WhisperX --threads.")
+  parser.add_argument("--print-progress", help="WhisperX --print_progress.")
+  parser.add_argument("--verbose", help="WhisperX --verbose.")
+  parser.add_argument("--log-level", help="WhisperX --log-level.")
+  parser.add_argument("--hotwords", help="WhisperX --hotwords.")
+
+  parser.add_argument("--diarize", dest="diarize", action="store_true", help="Enable diarization.")
+  parser.add_argument("--no-diarize", dest="diarize", action="store_false", help="Disable diarization.")
+  parser.set_defaults(diarize=None)
+  parser.add_argument(
+    "--skip-transcribe-existing",
+    action="store_true",
+    help="Skip files when output artifacts already exist.",
+  )
+  parser.set_defaults(skip_transcribe_existing=None)
+  parser.add_argument("--whisper-arg", action="append", default=[], help="Extra whisper argument, repeatable.")
+
+  parser.add_argument(
+    "--docker-image",
+    help="Docker image for whisperx runner (default: whisperx:torch280-cu128).",
+  )
+  parser.add_argument(
+    "--docker-pull-policy",
+    choices=["always", "missing"],
+    help="Docker --pull policy (default: missing).",
+  )
+  parser.add_argument("--docker-cache", help="Host cache directory for HF/torch caches.")
+
+  parser.add_argument("remaining", nargs="*", help="Pass-through args for whisperx (after --).")
+  parsed = parser.parse_args()
+  return parsed
+
+
+def apply_defaults(args: argparse.Namespace) -> Dict[str, object]:
+  return resolve_transcribe_defaults(args)
+
+
+def find_audio_files(input_dir: Path, recursive: bool) -> List[Path]:
+  files = []
+  pattern: Sequence[Path] = input_dir.rglob("*") if recursive else input_dir.glob("*")
+  for candidate in pattern:
+    if not candidate.is_file():
+      continue
+    if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
+      continue
+    files.append(candidate)
+  return sorted(files)
+
+
+def build_docker_run_command(
+  image: str,
+  pull_policy: str,
+  host_output_dir: str,
+  host_cuda_devices: List[str],
+  host_model_mounts: Sequence[str],
+  host_cache: str,
+  host_inputs: Sequence[Tuple[Path, str]],
+  whisper_args: Sequence[str],
+  whisper_output_dir: str,
+  whisper_input_container_dir: str,
+) -> List[str]:
+  cmd: List[str] = [
+    "docker",
+    "run",
+    "--rm",
+    "--interactive",
+    "--pull",
+    pull_policy,
+    "-u",
+    f"{os.getuid()}:{os.getgid()}",
+  ]
+
+  if not host_cuda_devices:
+    cmd += ["--gpus", "all"]
+  else:
+    cmd += ["--gpus", f"device={','.join(host_cuda_devices)}"]
+
+  cmd += [
+    "-v",
+    f"{Path(host_output_dir).resolve()}:/mnt/output",
+    "-v",
+    f"{Path(host_cache).resolve()}:/cache",
+    "-e",
+    "HF_HUB_OFFLINE=1",
+    "-e",
+    "HF_DATASETS_OFFLINE=1",
+    "-e",
+    "TRANSFORMERS_OFFLINE=1",
+    "-e",
+    "HF_HOME=/cache/hf",
+    "-e",
+    "TRANSFORMERS_CACHE=/cache/hf",
+    "-e",
+    "TORCH_HOME=/cache/torch",
+    "-e",
+    "XDG_CACHE_HOME=/cache/xdg",
+    "-e",
+    "NLTK_DATA=/cache/nltk_data",
+    "-e",
+    "MPLCONFIGDIR=/tmp/matplotlib",
+  ]
+
+  for mount in sorted(set(host_model_mounts)):
+    cmd.extend(("-v", f"{Path(mount).resolve()}:{Path(mount).resolve()}:ro"))
+
+  for input_path, mapped_name in host_inputs:
+    cmd.extend(("-v", f"{input_path.resolve()}:{whisper_input_container_dir}/{mapped_name}:ro"))
+
+  whisper_cmd = list(whisper_args)
+  whisper_cmd.extend(["--output_dir", whisper_output_dir])
+  whisper_cmd.extend((f"{whisper_input_container_dir}/{mapped_name}" for _, mapped_name in host_inputs))
+
+  cmd.append(image)
+  cmd.append(build_shell_command(whisper_cmd))
+  return cmd
+
+
+def execute_docker(cmd: List[str]) -> int:
+  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  if proc.returncode != 0:
+    if proc.stdout:
+      print(proc.stdout)
+  return proc.returncode
+
+
+def run_docker_batch(
+  batch_inputs: Sequence[Tuple[Path, str]],
+  image: str,
+  pull_policy: str,
+  output_dir: Path,
+  cache_scope: str,
+  cuda_devices: List[str],
+  model_mounts: Sequence[str],
+  whisper_args: Sequence[str],
+  whisper_input_container_dir: str,
+  diarize: bool,
+) -> int:
+  batch_docker_cmd = build_docker_run_command(
+    image=image,
+    pull_policy=pull_policy,
+    host_output_dir=str(output_dir),
+    host_cuda_devices=[str(dev) for dev in cuda_devices],
+    host_model_mounts=model_mounts,
+    host_cache=cache_scope,
+    host_inputs=batch_inputs,
+    whisper_args=whisper_args,
+    whisper_output_dir="/mnt/output",
+    whisper_input_container_dir=whisper_input_container_dir,
+  )
+  if os.environ.get("WHISPERX_DEBUG") == "1":
+    print("DEBUG: docker run command:")
+    print("  ", end="")
+    print(" ".join(f"{arg!s}" for arg in batch_docker_cmd))
+  status = execute_docker(batch_docker_cmd)
+
+  if status != 0 and diarize:
+    fallback_whisper_args = [arg for arg in whisper_args if arg not in {"--diarize"}]
+    fallback_docker_cmd = build_docker_run_command(
+      image=image,
+      pull_policy=pull_policy,
+      host_output_dir=str(output_dir),
+      host_cuda_devices=[str(dev) for dev in cuda_devices],
+      host_model_mounts=model_mounts,
+      host_cache=cache_scope,
+      host_inputs=batch_inputs,
+      whisper_args=fallback_whisper_args,
+      whisper_output_dir="/mnt/output",
+      whisper_input_container_dir=whisper_input_container_dir,
+    )
+    return execute_docker(fallback_docker_cmd)
+
+  return status
+
+
+def run() -> int:
+  args = parse_args()
+  values = apply_defaults(args)
+
+  input_dir = Path(str(values["input_dir"]))
+  output_dir = Path(str(values["output_dir"])).expanduser()
+  cuda_devices = parse_cuda_devices(str(values["cuda_devices"]))
+  output_format = str(values["output_format"])
+  output_exts = parse_output_format(output_format)
+
+  if not input_dir.is_dir():
+    print(f"ERROR: input directory not found: {input_dir}", file=sys.stderr)
+    return 2
+  ensure_dir(str(output_dir))
+  if not output_dir.is_dir():
+    print(f"ERROR: output directory not writable: {output_dir}", file=sys.stderr)
+    return 2
+
+  model = str(values["model"])
+  if not os.path.isabs(model):
+    model = str(Path(model).resolve())
+  model_path = Path(model).expanduser()
+  if not model_path.exists():
+    print(f"ERROR: --model not found: {model}", file=sys.stderr)
+    return 2
+
+  diarize = bool(values["diarize"])
+  diarize_model = str(values["diarize_model"])
+  if diarize:
+    if not os.path.isabs(diarize_model):
+      diarize_model = str(Path(diarize_model).resolve())
+    if not Path(diarize_model).exists():
+      print(f"ERROR: --diarize-model not found: {diarize_model}", file=sys.stderr)
+      return 2
+
+  align_model = str(values["align_model"])
+  if align_model and "/" in align_model:
+    align_path = Path(align_model)
+    if not align_path.is_absolute():
+      align_path = align_path.expanduser().resolve()
+    if not align_path.exists():
+      print(f"ERROR: --align-model not found: {align_model}", file=sys.stderr)
+      return 2
+    align_model = str(align_path)
+
+  try:
+    check_large_v3_layout(model_path)
+  except ValueError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    return 2
+
+  batch_size = parse_int(values["batch_size"])
+  if batch_size <= 0:
+    print("--batch-size must be >= 1", file=sys.stderr)
+    return 2
+
+  for opt_name, raw in (
+    ("max_speakers", values["max_speakers"]),
+    ("min_speakers", values["min_speakers"]),
+  ):
+    if str(raw):
+      if not is_positive_int(raw):
+        print(f"ERROR: --{opt_name} must be a positive integer.", file=sys.stderr)
+        return 2
+
+  input_files = find_audio_files(input_dir, bool(values["recursive"]))
+  if not input_files:
+    print(f"No input files found in {input_dir} with extensions: {', '.join(sorted(SUPPORTED_EXTENSIONS))}", file=sys.stderr)
+    return 0
+
+  if str(values["device"]).startswith(SUPPORTED_DEVICE_PREFIX):
+    if not cuda_devices:
+      cuda_devices = ["0"]
+  else:
+    cuda_devices = []
+
+  mapped_inputs = build_container_input_names(input_files)
+
+  skip_existing = bool(values["skip_transcribe_existing"])
+  pending_files: List[Tuple[Path, str]] = []
+  for audio, container_name in mapped_inputs:
+    if skip_existing and output_exists(output_dir, container_name, output_exts):
+      print(f"Skipping transcribe (exists): {audio}")
+      continue
+    pending_files.append((audio, container_name))
+
+  if not pending_files:
+    print("No files to transcribe (all outputs already exist).")
+    return 0
+
+  whisper_args = build_whisper_args(
+    model=str(model_path),
+    task=str(values["task"]),
+    language=str(values["language"]),
+    output_format=output_format,
+    device=str(values["device"]),
+    compute_type=str(values["compute_type"]),
+    batch_size=batch_size,
+    max_speakers=str(values["max_speakers"]),
+    align_model=str(align_model),
+    interpolate_method=str(values["interpolate_method"]),
+    no_align=bool(values["no_align"]),
+    return_char_alignments=bool(values["return_char_alignments"]),
+    vad_method=str(values["vad_method"]),
+    vad_onset=str(values["vad_onset"]),
+    vad_offset=str(values["vad_offset"]),
+    chunk_size=str(values["chunk_size"]),
+    diarize=diarize,
+    diarize_model=str(diarize_model),
+    speaker_embeddings=bool(values["speaker_embeddings"]),
+    temperature=str(values["temperature"]),
+    best_of=str(values["best_of"]),
+    beam_size=str(values["beam_size"]),
+    patience=str(values["patience"]),
+    length_penalty=str(values["length_penalty"]),
+    suppress_tokens=str(values["suppress_tokens"]),
+    suppress_numerals=bool(values["suppress_numerals"]),
+    initial_prompt=str(values["initial_prompt"]),
+    condition_on_previous_text=str(values["condition_on_previous_text"]),
+    fp16=str(values["fp16"]),
+    temperature_increment_on_fallback=str(values["temperature_increment_on_fallback"]),
+    compression_ratio_threshold=str(values["compression_ratio_threshold"]),
+    logprob_threshold=str(values["logprob_threshold"]),
+    no_speech_threshold=str(values["no_speech_threshold"]),
+    max_line_width=str(values["max_line_width"]),
+    max_line_count=str(values["max_line_count"]),
+    highlight_words=bool(values["highlight_words"]),
+    segment_resolution=str(values["segment_resolution"]),
+    min_speakers=str(values["min_speakers"]),
+    threads=str(values["threads"]),
+    print_progress=str(values["print_progress"]),
+    verbose=str(values["verbose"]),
+    log_level=str(values["log_level"]),
+    hotwords=str(values["hotwords"]),
+    extra_args=list(values["extra_args"]),
+  )
+
+  docker_cache = str(values["docker_cache"])
+  temp_cache: Optional[tempfile.TemporaryDirectory[str]] = None
+  try:
+    cache_scope, fallback = mount_cache(docker_cache)
+  except PermissionError:
+    temp_cache = tempfile.TemporaryDirectory(prefix="whisperx-cache-")
+    cache_scope = temp_cache.name
+    for sub in ("hf", "torch", "xdg", "nltk_data"):
+      (Path(cache_scope) / sub).mkdir(parents=True, exist_ok=True)
+    fallback = True
+
+  if fallback:
+    print(f"WARNING: cache root not writable ({docker_cache}); using temporary cache {cache_scope}", file=sys.stderr)
+
+  if shutil.which("docker") is None:
+    print("ERROR: docker is required for this tool.", file=sys.stderr)
+    if temp_cache is not None:
+      temp_cache.cleanup()
+    return 2
+
+  image = str(values["docker_image"])
+  if values["docker_pull_policy"] not in {"always", "missing"}:
+    print("ERROR: --docker-pull-policy must be one of always|missing", file=sys.stderr)
+    if temp_cache is not None:
+      temp_cache.cleanup()
+    return 2
+
+  model_mounts = collect_mount_ro_paths(
+    [str(model_path), str(diarize_model), str(align_model)],
+  )
+
+  # Keep first mapped input names visible for user.
+  print(f"Mode: docker (single process)")
+  print(f"Input directory: {input_dir}")
+  print(f"Output directory: {output_dir}")
+  print(f"Files to transcribe: {len(pending_files)}")
+  max_docker_files_raw = os.environ.get("WHISPERX_MAX_DOCKER_FILES", str(DEFAULT_MAX_DOCKER_FILES))
+  try:
+    max_docker_files = int(max_docker_files_raw)
+  except ValueError:
+    print(
+      f"WARNING: invalid WHISPERX_MAX_DOCKER_FILES={max_docker_files_raw!r}; using default {DEFAULT_MAX_DOCKER_FILES}.",
+      file=sys.stderr,
+    )
+    max_docker_files = DEFAULT_MAX_DOCKER_FILES
+  if max_docker_files < 1:
+    max_docker_files = DEFAULT_MAX_DOCKER_FILES
+
+  input_batches = chunk_inputs(pending_files, max_docker_files)
+  if len(input_batches) > 1:
+    print(
+      f"Input batching active: splitting {len(pending_files)} files into {len(input_batches)} docker run(s)"
+      f" (max files per run: {max_docker_files})."
+    )
+
+  if os.environ.get("WHISPERX_DEBUG") == "1":
+    print(f"Using WHISPERX_MAX_DOCKER_FILES={max_docker_files}")
+
+  try:
+    for batch_idx, batch_inputs in enumerate(input_batches, start=1):
+      print(f"Running docker batch {batch_idx}/{len(input_batches)}: {len(batch_inputs)} files")
+      status = run_docker_batch(
+        batch_inputs=batch_inputs,
+        image=image,
+        pull_policy=str(values["docker_pull_policy"]),
+        output_dir=output_dir,
+        cache_scope=cache_scope,
+        cuda_devices=[str(dev) for dev in cuda_devices],
+        model_mounts=model_mounts,
+        whisper_args=whisper_args,
+        whisper_input_container_dir="/mnt/input",
+        diarize=diarize,
+      )
+      if status != 0:
+        print(f"Batch {batch_idx} failed with status {status}", file=sys.stderr)
+        return status
+  finally:
+    if temp_cache is not None:
+      temp_cache.cleanup()
+
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(run())
