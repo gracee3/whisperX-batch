@@ -4,7 +4,7 @@ Parallel in-place FLAC->WAV converter using multiple ffmpeg processes.
 
 Examples:
   python scripts/convert_flac_to_wav.py \
-    --root /home/emmy/Downloads/LibriSpeech/dev-clean \
+    --root /path/to/LibriSpeech/dev-clean \
     --num-proc 8
 """
 

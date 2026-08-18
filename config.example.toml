@@ -1,10 +1,11 @@
-# WhisperX defaults for transcribe and benchmark.
+# Portable configuration template for transcribe and benchmark.
+# Copy to config.local.toml and replace every /path/to value locally.
 
 [transcribe]
-input_dir = "."
-output_dir = "~/transcribe"
+input_dir = "./audio"
+output_dir = "./output"
 cuda_devices = "0"
-model = "/data/models/Systran/faster-whisper-large-v3"
+model = "/path/to/models/faster-whisper-large-v3"
 task = "transcribe"
 language = "en"
 output_format = "all"
@@ -13,14 +14,14 @@ compute_type = "float16"
 batch_size = 16
 max_speakers = ""
 skip_transcribe_existing = false
-diarize = true
+diarize = false
 docker_image = "whisperx:torch280-cu128"
 docker_pull_policy = "missing"
-docker_cache = "/data/models/.hf-cache"
+docker_cache = "/path/to/cache/whisperx-batch"
 recursive = false
 
 [librispeech]
-root = "/home/emmy/Downloads/LibriSpeech"
+root = "/path/to/datasets/LibriSpeech"
 subset = "dev-clean"
 url = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 archive = "dev-clean.tar.gz"
@@ -31,33 +32,19 @@ keep_archive = true
 convert_if_missing_only = false
 
 [benchmark]
-dataset = "/home/emmy/Downloads/LibriSpeech/dev-clean"
+dataset = "/path/to/datasets/LibriSpeech/dev-clean"
 transcribe = "transcribe"
 ext = "wav"
-output_root = "~/transcribe/temp/whisperx-benchmark"
-# Locked quality-focused benchmark defaults (GPU1, 200-file dev-clean sweep, 2026-03-14):
-# batch_size=16, beam_size=1, best_of=1, temperature=0.0, suppress_numerals=false, no_diarize=true.
+output_root = "./benchmark-output"
 output_format = "json"
 score_format = "json"
 max_files = 0
 batch_size = 16
 skip_transcribe_existing = false
 no_diarize = true
-transcribe_config = "config.toml"
+transcribe_config = "config.local.toml"
 results_csv = ""
 limit = 0
-
-# Alternate preset example for quick switch:
-# [librispeech]
-# root = "/home/emmy/Downloads/LibriSpeech"
-# subset = "test-clean"
-# url = "https://www.openslr.org/resources/12/test-clean.tar.gz"
-# archive = "test-clean.tar.gz"
-# convert_to_wav = true
-# convert_num_proc = 8
-# ffmpeg_threads = 0
-# keep_archive = true
-# convert_if_missing_only = false
 
 [whisper]
 align_model = "WAV2VEC2_ASR_BASE_960H"
@@ -69,11 +56,9 @@ vad_onset = ""
 vad_offset = ""
 chunk_size = ""
 min_speakers = ""
-diarize_model = "/data/models/pyannote/speaker-diarization-community-1"
+diarize_model = "/path/to/models/pyannote/speaker-diarization-community-1"
 speaker_embeddings = false
 temperature = 0
-# Locked quality defaults from benchmark finding on this stack:
-# beam_size=1 and best_of=1 gave best WER with equal or better runtime in GPU1 200-file tuning.
 best_of = 1
 beam_size = 1
 patience = 1.0

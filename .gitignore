@@ -29,6 +29,7 @@ __pycache__/
 .env
 .env.*
 *.env
+config.local.toml
 
 # ---- OS/editor noise ----
 .DS_Store

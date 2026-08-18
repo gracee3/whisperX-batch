@@ -23,7 +23,7 @@ from script_defaults import resolve_benchmark_defaults
 from benchmark_utils import parse_kv_items, whisper_arg_for_sweep
 
 
-DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "config.toml")
+DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "config.local.toml")
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--transcribe-config",
     default=None,
-    help="Optional transcribe config.toml to reuse for every run.",
+    help="Optional transcribe TOML config to reuse for every run.",
   )
   parser.add_argument(
     "--set",
@@ -309,8 +309,7 @@ def build_run_command(
   ]
   if args.skip_transcribe_existing:
     cmd.append("--skip-transcribe-existing")
-  if not args.no_diarize:
-    cmd.append("--diarize")
+  cmd.append("--no-diarize" if args.no_diarize else "--diarize")
   if args.transcribe_config:
     cmd.extend(["--config", args.transcribe_config])
 

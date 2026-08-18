@@ -1,285 +1,170 @@
 # whisperX-batch
 
-**Status:** Active, working software undergoing release hardening. There is no tagged compatibility guarantee yet; benchmark results below are maintainer baselines on the stated hardware.
+**Status:** Active stabilization. Tags `v0.1.0` and `v0.2.0` are historical
+stack checkpoints, not a promise that current `main` is a compatible packaged
+release. The next release boundary will be cut only after offline CI and a
+reproducible GPU validation record agree.
 
-whisperX-batch is a Docker-first batch ASR stack for local environments.
-It runs WhisperX transcription with optional diarization over directories of files, supports reproducible benchmark sweeps, and is tuned for deterministic local/offline execution.
+`whisperX-batch` is the Docker-first batch transcription and benchmark harness I
+use for local GPU work. It turns an explicit config into a WhisperX invocation,
+keeps models and caches outside the image, processes one visible GPU per run,
+and records sweep-level WER and throughput data.
 
-## Stack
+The interesting part is the control plane around WhisperX: predictable
+arguments, read-only inputs/model mounts, offline cache behavior, bounded Docker
+command sizes, resume semantics, and benchmark bookkeeping. It does not contain
+a speech model and does not claim a new ASR method.
 
-Key versions and base images are pinned in `Dockerfile.whisperx-torch280-cu128`:
-
-- Ubuntu: `ubuntu22.04`
-- Python: `3.11`
-- CUDA runtime: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04`
-- torch: `2.8.0+cu128`
-- torchaudio: `2.8.0+cu128`
-- triton: `>=3.3.0`
-- [CTranslate2](https://github.com/OpenNMT/CTranslate2): `4.7.1`
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper): `1.2.1`
-- [openai/whisper](https://github.com/openai/whisper)
-- [WhisperX](https://github.com/m-bain/whisperx): `3.8.2`
-- pyannote-audio: `4.0.4`
-- transformers: `>=4.48.0`
-
-## What it does
-
-- Transcribe directories or file trees with `transcribe` (Docker-only).
-- Run parameter sweeps and WER scoring with `whisperx-benchmark`.
-- Cache outputs so reruns skip completed files.
-- Keep model and cache directories on disk and run without remote model downloads.
-
-## Install / Setup
-
-```bash
-make install
-make preflight
-```
-
-Install command is created in:
-
-- `~/.local/bin` (default)
-- custom via `make install BINDIR=/usr/local/bin`
-
-## CLI defaults and config
-
-Both CLIs default to repo `config.toml`.
+## Design boundary
 
 ```text
--c, --config PATH         TOML config override
---no-config                ignore config defaults
+config.local.toml + CLI
+          |
+          v
+  transcribe control plane ----> one Docker process / one visible GPU
+          |                             |
+          |                             +--> local model + cache mounts
+          |                             +--> read-only audio mounts
+          v
+  transcript artifacts <-------- /mnt/output
+          |
+          v
+  whisperx-benchmark ----> WER, throughput, optional GPU trace
 ```
 
-Benchmark and transcribe configs are now centralized in the same file.
+- Each `transcribe` invocation is single-process and owns one selected GPU.
+- Multi-GPU work is explicit: launch independent invocations over independent
+  shards rather than relying on a hidden scheduler.
+- The image contains the runtime, not model snapshots, datasets, credentials, or
+  personal audio.
+- File-level output detection can skip completed work; it is not a transactional
+  job database.
+- Docker, GPU, model, dataset, audio, and network operations are never part of
+  the default test target.
 
-Run benchmark with an explicit config path:
+See [Architecture](docs/ARCHITECTURE.md) for the component and failure model.
+
+## Stack checkpoint
+
+The current Dockerfile is based on CUDA 12.8.1 and Python 3.11 with pinned
+Torch 2.8.0, torchaudio 2.8.0, CTranslate2 4.7.1, faster-whisper 1.2.1,
+WhisperX 3.8.2, and pyannote-audio 4.0.4. Triton and Transformers currently use
+lower bounds rather than exact pins, so rebuilding the image is not yet an
+immutable reproduction of the historical v0.2 stack.
+
+That remaining dependency lock is a release-hardening item, not something the
+current README quietly calls reproducible.
+
+## Local configuration
+
+The tracked file is a portable template. The real config is ignored because it
+usually contains local paths and may reveal model, dataset, and host layout.
 
 ```bash
-whisperx-benchmark --dataset ./dataset --config /path/to/config.toml
+cp config.example.toml config.local.toml
+${EDITOR:-vi} config.local.toml
 ```
 
-## Required local assets
-
-- Whisper model: `/data/models/Systran/faster-whisper-large-v3`
-- Diarization model: `/data/models/pyannote/speaker-diarization-community-1`
-- HF/torch cache: `/data/models/.hf-cache`
-
-Optional alignment artifacts:
-
-- `/data/models/.hf-cache/nltk_data/tokenizers/punkt_tab`
-- `/data/models/.hf-cache/torch/hub/checkpoints/wav2vec2_fairseq_base_ls960_asr_ls960.pth`
-
-Preseed and validate caches:
+Both entrypoints default to `config.local.toml`. An explicit config can be used
+instead:
 
 ```bash
-python scripts/preseed_whisperx_cache.py --cache-dir /data/models/.hf-cache
-test -f /data/models/.hf-cache/nltk_data/tokenizers/punkt_tab/english/README
+./transcribe --config /path/to/config.local.toml --input-dir /path/to/audio
+./whisperx-benchmark --config /path/to/config.local.toml \
+  --dataset /path/to/LibriSpeech/dev-clean
 ```
 
-## Recommended run pattern
+## Build and run
 
-Transcribe:
+Building the runtime image downloads packages and requires separate network and
+Docker authorization:
+
+```bash
+docker build \
+  -f Dockerfile.whisperx-torch280-cu128 \
+  -t whisperx:torch280-cu128 .
+```
+
+Validate local runtime prerequisites, then install symlinks into
+`~/.local/bin`:
+
+```bash
+make preflight
+make install
+```
+
+A typical non-diarized run is:
 
 ```bash
 transcribe \
   --input-dir /path/to/audio \
-  --output-dir /path/to/out \
-  --cuda-devices 1 \
+  --output-dir /path/to/output \
+  --cuda-devices 0 \
   --batch-size 16 \
   --no-diarize \
   --skip-transcribe-existing
 ```
 
-Benchmark:
+Use `transcribe --help` and `whisperx-benchmark --help` for the current option
+surface. [CLI notes](docs/CLI.md) describe precedence, mounts, output detection,
+and sweep behavior without duplicating generated help text here.
+
+## Offline development check
 
 ```bash
-whisperx-benchmark \
-  --dataset /path/to/dataset \
-  --ext wav \
-  --output-root /path/to/out \
-  --results-csv /path/to/out/results.csv \
-  --output-format json \
-  --score-format json \
-  --set no-diarize=true \
-  --set beam_size=1 \
-  --set best_of=1 \
-  --set temperature=0.0 \
-  --set suppress_numerals=false
+make test
 ```
 
-## Core options
+This uses only Python's standard library. It tests config precedence, argument
+construction, file discovery and output detection, Docker command construction,
+sweep parsing, manifests, WER, result parsing, GPU-trace summaries, and safe
+helper behavior. It does not build or start a container and does not access a
+GPU, model, dataset, audio file, or network.
 
-Use `transcribe --help` and `whisperx-benchmark --help` for full option surfaces.
-Most-used high-impact knobs:
+## Benchmarks
 
-- `--batch-size`
-- `--cuda-devices`
-- `--model`
-- `--diarize` / `--no-diarize`
-- `--beam-size`
-- `--best-of`
-- `--temperature`
-- `--suppress-numerals`
-- `--whisper-arg` / `--` passthrough
+`whisperx-benchmark` supports Cartesian parameter sweeps, LibriSpeech-style
+references, run-level CSV results, and optional `nvidia-smi` traces. A benchmark
+is publishable evidence only when it records the repository commit, image
+digest, dependency/model/corpus revisions, exact config and command, hardware
+context, repetitions, correctness result, resource measurements, failures, and
+limitations.
 
-The benchmark runner maps `--sweep` axes to transcribe args with correct boolean handling for
-`no-diarize`, `diarize`, and other on/off toggles.
+The old `batch_size=16`, `beam_size=1`, `best_of=1`, `temperature=0.0`,
+`suppress_numerals=false`, non-diarized settings are retained as a historical
+maintainer observation from a 200-file LibriSpeech `dev-clean` RTX 3090 sweep on
+2026-03-14. The repository does not currently contain enough raw evidence to
+present that observation as a reproducible comparative result.
 
-## Behavior notes
+See [Benchmark publication](docs/BENCHMARKING.md).
 
-- Whisper and alignment run inside a single process per `transcribe` invocation.
-- By design, `transcribe` processes are single-process and single-GPU visible per run (`--cuda-devices`).
-- For multi-GPU throughput, launch multiple independent invocations across shards.
-- No ffmpeg transcoding is performed inside `transcribe`; prepare files using the helper scripts first.
-- WER sweeps write run-level metrics to `results.csv`, including:
-  - `avg_wer`
-  - `files_per_second`
-  - `seconds_per_file`
-  - `input_toks_per_sec_*`
-  - `decode_toks_per_sec_*`
-  - `encode_toks_per_sec_*`
+## Privacy and limitations
 
-## Helper scripts
+- Audio, transcripts, model caches, tokens, local configs, and benchmark outputs
+  are intentionally ignored and must be reviewed before sharing.
+- The helpers can download public datasets or cache artifacts, but only when run
+  explicitly. Dataset/model terms still apply.
+- Diarization can process sensitive voice identity information. This repository
+  supplies mechanics, not consent or a retention policy for someone else's
+  recordings.
+- WER on one public corpus does not establish accuracy for other speakers,
+  languages, recording conditions, or high-stakes use.
+- No filtering, queue service, distributed scheduler, or automatic multi-GPU
+  coordination is promised.
 
-- `scripts/setup_librispeech_dataset.py`  
-  one-step LibriSpeech download and conversion.
-- `scripts/convert_flac_to_wav.py`  
-  explicit FLAC-to-WAV conversion.
-- `scripts/clean_audio.py`  
-  local audio normalization/denoise helper.
+See [Publication, privacy, and research notes](docs/PUBLICATION.md) and
+[provenance](docs/PROVENANCE.md).
 
-## Repository baseline findings
+## Project posture
 
-On a 200-file `dev-clean` GPU1 sweep (`~/transcribe/temp/whisperx-benchmark`), the repo defaults currently prefer:
+This is a personal tool. Focused fixes and reproducible reports are useful, but
+there is no support or response-time commitment. The aim is a small harness that
+works predictably on its documented local stack, not broad packaging or adoption.
 
-- `batch_size=16`
-- `beam_size=1`
-- `best_of=1`
-- `temperature=0.0`
-- `suppress_numerals=false`
-- `no-diarize`
-
-These defaults are stored in `config.toml`.
-Tested on: NVIDIA GeForce RTX 3090 (24 GB VRAM), using GPU1 for all reported sweeps.
-
-## Hardening and runtime behavior
-
-- Inputs/outputs are normalized to absolute paths.
-- Batch submission is split automatically to avoid command-line length limits.
-- Docker mounts only required caches and mounts as caller UID/GID.
-- Environment defaults keep model access offline:
-  - `HF_HUB_OFFLINE=1`
-  - `HF_DATASETS_OFFLINE=1`
-  - `TRANSFORMERS_OFFLINE=1`
-
-## Project layout
-
-```text
-.
-├── transcribe
-├── whisperx-benchmark
-├── config.toml
-├── Dockerfile.whisperx-torch280-cu128
-├── output/
-└── README.md
-```
-
-## Full CLI Args
-
-### transcribe
-
-```text
--c, --config PATH         Load defaults from TOML config file.
---no-config               Ignore config file.
---input-dir DIR           Input directory containing audio files.
---output-dir DIR          Output directory for transcript artifacts.
---cuda-devices CSV        Comma-separated CUDA device IDs (defaults to 0).
---recursive               Recurse into subdirectories when discovering files.
---no-recursive            Disable recursion (default).
---model PATH              WhisperX model path (required local snapshot).
---task TEXT               WhisperX task.
---language TEXT           WhisperX language.
---output-format TEXT      WhisperX output format.
---align-model PATH        WhisperX align model/path.
---interpolate-method TEXT WhisperX interpolation method.
---no-align                Disable alignment.
---return-char-alignments  Enable character-level alignments.
---vad-method TEXT         WhisperX VAD method.
---vad-onset TEXT          WhisperX VAD onset.
---vad-offset TEXT         WhisperX VAD offset.
---chunk-size TEXT         WhisperX chunk size.
---device TEXT             WhisperX --device argument.
---compute-type TEXT       WhisperX --compute_type argument.
---batch-size TEXT         WhisperX --batch_size argument.
---max-speakers TEXT       WhisperX --max_speakers.
---min-speakers TEXT       WhisperX --min_speakers.
---diarize-model PATH      WhisperX diarize model path.
---speaker-embeddings      Enable speaker embeddings.
---temperature TEXT        WhisperX --temperature.
---best-of TEXT            WhisperX --best_of.
---beam-size TEXT          WhisperX --beam_size.
---patience TEXT           WhisperX --patience.
---length-penalty TEXT     WhisperX --length_penalty.
---suppress-tokens TEXT    WhisperX --suppress_tokens.
---suppress-numerals       Enable suppress_numerals.
---initial-prompt TEXT     WhisperX --initial_prompt.
---condition-on-previous-text TEXT
-                         WhisperX --condition_on_previous_text.
---fp16 TEXT              WhisperX --fp16.
---temperature-increment-on-fallback TEXT
-                         WhisperX --temperature_increment_on_fallback.
---compression-ratio-threshold TEXT
-                         WhisperX --compression_ratio_threshold.
---logprob-threshold TEXT  WhisperX --logprob_threshold.
---no-speech-threshold TEXT
-                         WhisperX --no_speech_threshold.
---max-line-width TEXT     WhisperX --max_line_width.
---max-line-count TEXT     WhisperX --max_line_count.
---highlight-words         Enable highlight_words output.
---segment-resolution TEXT WhisperX --segment_resolution.
---threads TEXT            WhisperX --threads.
---print-progress TEXT     WhisperX --print_progress.
---verbose TEXT            WhisperX --verbose.
---log-level TEXT          WhisperX --log-level.
---hotwords TEXT           WhisperX --hotwords.
---diarize                 Enable diarization.
---no-diarize              Disable diarization.
---skip-transcribe-existing Skip files when output artifacts already exist.
---whisper-arg ARG         Extra whisper argument, repeatable.
---docker-image TEXT       Docker image for whisperx runner.
---docker-pull-policy {always,missing}
-                         Docker --pull policy (default: missing).
---docker-cache PATH       Host cache directory for HF/torch caches.
--- [ARGS ...]            Pass-through args for whisperx.
-```
-
-### whisperx-benchmark
-
-```text
--c, --config PATH          Load benchmark defaults from TOML config file.
---dataset PATH              Dataset root directory.
---ext {wav}                 Audio extension to process (without dot).
---transcribe PATH           transcribe executable.
---output-root PATH          Benchmark output root.
---output-format {all,txt,json,srt,vtt,tsv,aud}
-                           Output format passed to transcribe.
---score-format {txt,json,srt,vtt,tsv,aud}
-                           Reference file extension used when scoring.
---max-files N               Optional cap on files per run (0 = no cap).
---batch-size N              batch-size passed to transcribe.
---transcribe-config PATH    transcribe config.toml for every run.
---set KEY=VAL               Fixed whisper option for every run (repeatable).
---sweep KEY=VAL1,VAL2       Tune candidate set (repeatable).
---whisper-arg ARG           Extra transcribe --whisper-arg token (repeatable).
---skip-transcribe-existing   Pass transcribe --skip-transcribe-existing.
---results-csv PATH          Optional CSV destination.
---limit N                   Limit number of runs evaluated (debug).
---diarize                   Enable diarization.
---no-diarize                Pass transcribe --no-diarize (default).
---trace                     Collect GPU resource traces.
---trace-interval SEC        Interval between trace samples (seconds).
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT
+The repository's original orchestration code and documentation are available
+under the [MIT License](LICENSE). Models, datasets, base images, and Python
+packages retain their own terms.

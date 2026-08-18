@@ -22,10 +22,10 @@ def resolve_transcribe_defaults(args: argparse.Namespace) -> Dict[str, object]:
 
   return {
     "input_dir": str(Path(choose_value(trans_cfg, args.input_dir, "input_dir", ".")).expanduser()),
-    "output_dir": str(Path(choose_value(trans_cfg, args.output_dir, "output_dir", "~/transcribe")).expanduser()),
+    "output_dir": str(Path(choose_value(trans_cfg, args.output_dir, "output_dir", "./output")).expanduser()),
     "cuda_devices": choose_value(trans_cfg, args.cuda_devices, "cuda_devices", "0"),
     "recursive": choose_bool(trans_cfg, args.recursive, "recursive", False),
-    "model": choose_value(trans_cfg, args.model, "model", "/data/models/Systran/faster-whisper-large-v3"),
+    "model": choose_value(trans_cfg, args.model, "model", "/models/faster-whisper-large-v3"),
     "task": choose_value(trans_cfg, args.task, "task", "transcribe"),
     "language": choose_value(trans_cfg, args.language, "language", "en"),
     "output_format": choose_value(trans_cfg, args.output_format, "output_format", "all"),
@@ -39,12 +39,12 @@ def resolve_transcribe_defaults(args: argparse.Namespace) -> Dict[str, object]:
       "skip_transcribe_existing",
       False,
     ),
-    "diarize": choose_bool(trans_cfg, args.diarize, "diarize", True),
+    "diarize": choose_bool(trans_cfg, args.diarize, "diarize", False),
     "docker_image": choose_value(trans_cfg, args.docker_image, "docker_image", "whisperx:torch280-cu128"),
     "docker_pull_policy": str(
       choose_value(trans_cfg, args.docker_pull_policy, "docker_pull_policy", "missing"),
     ).strip(),
-    "docker_cache": choose_value(trans_cfg, args.docker_cache, "docker_cache", "/data/models/.hf-cache"),
+    "docker_cache": choose_value(trans_cfg, args.docker_cache, "docker_cache", "~/.cache/whisperx-batch"),
     "align_model": choose_value(whisper_cfg, args.align_model, "align_model", "WAV2VEC2_ASR_BASE_960H"),
     "interpolate_method": choose_value(whisper_cfg, args.interpolate_method, "interpolate_method", ""),
     "no_align": choose_bool(whisper_cfg, args.no_align, "no_align", False),
@@ -53,7 +53,7 @@ def resolve_transcribe_defaults(args: argparse.Namespace) -> Dict[str, object]:
     "vad_onset": choose_value(whisper_cfg, args.vad_onset, "vad_onset", ""),
     "vad_offset": choose_value(whisper_cfg, args.vad_offset, "vad_offset", ""),
     "chunk_size": choose_value(whisper_cfg, args.chunk_size, "chunk_size", ""),
-    "diarize_model": choose_value(whisper_cfg, args.diarize_model, "diarize_model", "/data/models/pyannote/speaker-diarization-community-1"),
+    "diarize_model": choose_value(whisper_cfg, args.diarize_model, "diarize_model", ""),
     "speaker_embeddings": choose_bool(whisper_cfg, args.speaker_embeddings, "speaker_embeddings", False),
     "temperature": str(choose_value(whisper_cfg, args.temperature, "temperature", "")),
     "best_of": str(choose_value(whisper_cfg, args.best_of, "best_of", "")),
@@ -126,7 +126,7 @@ def resolve_benchmark_defaults(args: argparse.Namespace) -> argparse.Namespace:
   defaults["transcribe"] = choose_value(bench_cfg, args.transcribe, "transcribe", "transcribe")
   defaults["output_root"] = str(
     Path(
-      choose_value(bench_cfg, args.output_root, "output_root", "~/transcribe/temp/whisperx-benchmark"),
+      choose_value(bench_cfg, args.output_root, "output_root", "./benchmark-output"),
     ).expanduser(),
   )
   defaults["output_format"] = choose_value(bench_cfg, args.output_format, "output_format", "all")
@@ -138,7 +138,7 @@ def resolve_benchmark_defaults(args: argparse.Namespace) -> argparse.Namespace:
       bench_cfg,
       args.transcribe_config,
       "transcribe_config",
-      str(Path(__file__).resolve().parent / "config.toml"),
+      str(Path(__file__).resolve().parent / "config.local.toml"),
     ),
   )
   defaults["skip_transcribe_existing"] = choose_bool(
@@ -153,7 +153,7 @@ def resolve_benchmark_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
   if not defaults["dataset"]:
     raise SystemExit(
-      "ERROR: dataset is required. Set [benchmark].dataset in config.toml or pass --dataset.",
+      "ERROR: dataset is required. Set [benchmark].dataset in config.local.toml or pass --dataset.",
     )
 
   transcribe_config = str(defaults["transcribe_config"]).strip()

@@ -6,10 +6,10 @@ cleaning step, writing a cleaned WAV file next to each input unless an output
 directory is provided.
 
 Examples:
-  python3 scripts/clean_audio.py /home/emmy/Music/260312_0906.wav
-  python3 scripts/clean_audio.py /tmp/a.wav /tmp/b.flac --overwrite
-  python3 scripts/clean_audio.py /tmp/meeting1.mp3 /tmp/meeting2.wav \
-    --output-dir /tmp/clean-audio --jobs 4
+  python3 scripts/clean_audio.py /path/to/recording.wav
+  python3 scripts/clean_audio.py /path/to/a.wav /path/to/b.flac --overwrite
+  python3 scripts/clean_audio.py /path/to/meeting.mp3 \
+    --output-dir /path/to/clean-audio --jobs 4
 """
 
 from __future__ import annotations
