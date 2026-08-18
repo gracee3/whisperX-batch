@@ -16,7 +16,7 @@ from config_utils import parse_bool
 from script_defaults import resolve_transcribe_defaults
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = str(SCRIPT_DIR / "config.toml")
+DEFAULT_CONFIG_PATH = str(SCRIPT_DIR / "config.local.toml")
 DEFAULT_OUTPUT_EXTS = ("json", "srt", "tsv", "vtt", "txt", "aud")
 SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".mp3", ".flac"}
 SUPPORTED_DEVICE_PREFIX = "cuda"
@@ -262,6 +262,11 @@ def collect_mount_ro_paths(paths: Sequence[str]) -> List[str]:
   return sorted(mounts.keys())
 
 
+def resolve_host_path(raw: str) -> Path:
+  path = Path(raw).expanduser()
+  return path if path.is_absolute() else path.resolve()
+
+
 def shell_quote(value: str) -> str:
   return "'" + value.replace("'", "'\\''") + "'"
 
@@ -468,6 +473,22 @@ def execute_docker(cmd: List[str]) -> int:
   return proc.returncode
 
 
+def without_diarization_args(args: Sequence[str]) -> List[str]:
+  out: List[str] = []
+  skip_value = False
+  for arg in args:
+    if skip_value:
+      skip_value = False
+      continue
+    if arg == "--diarize_model":
+      skip_value = True
+      continue
+    if arg in {"--diarize", "--speaker_embeddings"}:
+      continue
+    out.append(arg)
+  return out
+
+
 def run_docker_batch(
   batch_inputs: Sequence[Tuple[Path, str]],
   image: str,
@@ -499,7 +520,7 @@ def run_docker_batch(
   status = execute_docker(batch_docker_cmd)
 
   if status != 0 and diarize:
-    fallback_whisper_args = [arg for arg in whisper_args if arg not in {"--diarize"}]
+    fallback_whisper_args = without_diarization_args(whisper_args)
     fallback_docker_cmd = build_docker_run_command(
       image=image,
       pull_policy=pull_policy,
@@ -535,10 +556,8 @@ def run() -> int:
     print(f"ERROR: output directory not writable: {output_dir}", file=sys.stderr)
     return 2
 
-  model = str(values["model"])
-  if not os.path.isabs(model):
-    model = str(Path(model).resolve())
-  model_path = Path(model).expanduser()
+  model_path = resolve_host_path(str(values["model"]))
+  model = str(model_path)
   if not model_path.exists():
     print(f"ERROR: --model not found: {model}", file=sys.stderr)
     return 2
@@ -546,17 +565,14 @@ def run() -> int:
   diarize = bool(values["diarize"])
   diarize_model = str(values["diarize_model"])
   if diarize:
-    if not os.path.isabs(diarize_model):
-      diarize_model = str(Path(diarize_model).resolve())
+    diarize_model = str(resolve_host_path(diarize_model))
     if not Path(diarize_model).exists():
       print(f"ERROR: --diarize-model not found: {diarize_model}", file=sys.stderr)
       return 2
 
   align_model = str(values["align_model"])
   if align_model and "/" in align_model:
-    align_path = Path(align_model)
-    if not align_path.is_absolute():
-      align_path = align_path.expanduser().resolve()
+    align_path = resolve_host_path(align_model)
     if not align_path.exists():
       print(f"ERROR: --align-model not found: {align_model}", file=sys.stderr)
       return 2

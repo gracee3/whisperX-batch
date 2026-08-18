@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-seed WhisperX offline cache artifacts.")
     parser.add_argument(
         "--cache-dir",
-        default="/data/models/.hf-cache",
+        default="~/.cache/whisperx-batch",
         help="Base cache directory for WhisperX runtime artifacts.",
     )
     parser.add_argument(

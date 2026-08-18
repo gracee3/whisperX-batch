@@ -25,8 +25,8 @@ except ModuleNotFoundError:  # pragma: no cover - py3.11 fallback compatibility 
 
 OPENSLR_ROOT = "https://www.openslr.org/resources/12"
 DEFAULT_SUBSET = "dev-clean"
-DEFAULT_ROOT = "~/Downloads/LibriSpeech"
-DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent.parent / "config.toml")
+DEFAULT_ROOT = "~/datasets/LibriSpeech"
+DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent.parent / "config.local.toml")
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     "-c",
     "--config",
     default=DEFAULT_CONFIG_PATH,
-    help="Path to config.toml (default: repo-root/config.toml).",
+    help="Path to local config (default: repo-root/config.local.toml).",
   )
   parser.add_argument(
     "--subset",
