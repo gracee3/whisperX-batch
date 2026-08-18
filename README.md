@@ -1,5 +1,7 @@
 # whisperX-batch
 
+**Status:** Active, working software undergoing release hardening. There is no tagged compatibility guarantee yet; benchmark results below are maintainer baselines on the stated hardware.
+
 whisperX-batch is a Docker-first batch ASR stack for local environments.
 It runs WhisperX transcription with optional diarization over directories of files, supports reproducible benchmark sweeps, and is tuned for deterministic local/offline execution.
 
